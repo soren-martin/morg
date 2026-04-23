@@ -117,21 +117,25 @@ def remove_quoted_replies(text: str) -> str:
 # Token-budget truncation
 # ---------------------------------------------------------------------------
 
-# Approximate ratio: 1 token ≈ 0.75 words for English prose.
-_TOKEN_BUDGET = 500
-_WORDS_PER_TOKEN = 0.75
-_WORD_BUDGET = int(_TOKEN_BUDGET * _WORDS_PER_TOKEN)  # ≈ 375 words
+# 500 tokens * ~4 chars/token = 2000 chars. Character truncation is more
+# reliable than word-splitting on messy email text that may contain long
+# unbroken strings (URLs, base64 fragments, MIME headers).
+_CHAR_BUDGET = 2000
 
 
-def truncate_to_token_budget(text: str, word_budget: int = _WORD_BUDGET) -> str:
+def truncate_to_token_budget(text: str, char_budget: int = _CHAR_BUDGET) -> str:
     """
-    Truncate *text* so it contains at most *word_budget* whitespace-delimited
-    tokens (a close enough proxy for LLM tokens for English email body text).
+    Truncate *text* to at most *char_budget* characters.
+    This reliably caps prompt size regardless of token/word ambiguity.
     """
-    words = text.split()
-    if len(words) <= word_budget:
+    if len(text) <= char_budget:
         return text
-    return " ".join(words[:word_budget]) + " […]"
+    # Try to break at a word boundary rather than mid-word.
+    truncated = text[:char_budget]
+    last_space = truncated.rfind(" ")
+    if last_space > char_budget * 0.8:  # only snap back if space is close
+        truncated = truncated[:last_space]
+    return truncated + " […]"
 
 
 # ---------------------------------------------------------------------------
@@ -166,12 +170,7 @@ def extract_text_and_attachments(
     """
     Walk a MIME message tree and return:
       - body_text: the best plain-text representation of the message body
-      - attachment_names: list of "filename.ext" strings for all attachments
-
-    Strategy:
-      1. Prefer text/plain parts that are not attachments.
-      2. Fall back to text/html parts (stripped) if no plain text found.
-      3. Collect Content-Disposition: attachment filename + extension.
+      - attachment_names: list of filenames for all attachments
     """
     if isinstance(raw, bytes):
         msg: Message = message_from_bytes(raw)
@@ -190,7 +189,7 @@ def extract_text_and_attachments(
             filename = part.get_filename()
             if filename:
                 attachment_names.append(filename)
-            continue  # Do not treat attachment payloads as body text.
+            continue
 
         if content_type == "text/plain":
             plain_parts.append(_decode_payload(part))
@@ -198,14 +197,17 @@ def extract_text_and_attachments(
             html_parts.append(_decode_payload(part))
 
     if plain_parts:
-        body_text = "\n\n".join(plain_parts)
+        raw_plain = "\n\n".join(plain_parts)
+        # Some senders label HTML content as text/plain. Strip tags if present.
+        if re.search(r"<[a-zA-Z][^>]*>", raw_plain):
+            raw_plain = strip_html(raw_plain)
+        body_text = raw_plain
     elif html_parts:
         body_text = strip_html("\n\n".join(html_parts))
     else:
         body_text = ""
 
     return body_text, attachment_names
-
 
 # ---------------------------------------------------------------------------
 # Gmail API payload decoder
