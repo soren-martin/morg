@@ -50,7 +50,7 @@ _SYSTEM_PROMPT = (
 _USER_PROMPT_TEMPLATE = """\
 Classify this email. Return a JSON object with these keys:
   - "category": one of [correspondence, advertising, newsletter, notification, spam]
-  - "action_required": true or false
+  - "action_required": true or false - follow the strict rules below
   - "action_reason": brief string if action_required is true, else null
 
   Category definitions:
@@ -67,6 +67,17 @@ service; includes shipping updates, login alerts, password resets, receipts, and
 calendar invites.
   - spam: Unsolicited, deceptive, or malicious email the user did not request and has \
 no legitimate relationship with; includes phishing, scams, and bulk junk.
+
+action_required rules (apply strictly — when in doubt, use false):
+  - correspondence: ALWAYS true
+  - advertising:    ALWAYS false
+  - newsletter:     ALWAYS false
+  - spam:           ALWAYS false
+  - notification:   Usually false. Set true ONLY for genuinely urgent alerts such as: \
+a direct message from a recruiter or employer, a security alert requiring a credential \
+change, a payment failure, or a time-sensitive deadline. Routine activity \
+(shipping progress, social media likes/views, marketing re-engagement, low-priority \
+calendar reminders) is false.
 
 Subject: {subject}
 From: {sender}
@@ -201,6 +212,34 @@ def _parse_classification(raw: str, message_id: str) -> ClassificationResult:
     # Coerce a non-null action_reason to a plain string.
     if action_reason is not None:
         action_reason = str(action_reason).strip() or None
+
+    # -------------------------------------------------------------------
+    # Hard override: enforce per-category action_required rules regardless
+    # of what the model returned.  The LLM is only trusted to make the
+    # call for "notification"; all other categories are deterministic.
+    # -------------------------------------------------------------------
+    _ALWAYS_ACTION_REQUIRED = {"correspondence"}
+    _NEVER_ACTION_REQUIRED  = {"advertising", "newsletter", "spam"}
+
+    if category in _ALWAYS_ACTION_REQUIRED:
+        if not action_required:
+            logger.debug(
+                "Overriding action_required to True for category=%s (msg=%s)",
+                category, message_id,
+            )
+        action_required = True
+        # Ensure there is always a reason string for correspondence.
+        if not action_reason:
+            action_reason = "Direct communication requires a response."
+
+    elif category in _NEVER_ACTION_REQUIRED:
+        if action_required:
+            logger.debug(
+                "Overriding action_required to False for category=%s (msg=%s)",
+                category, message_id,
+            )
+        action_required = False
+        action_reason   = None
 
     return ClassificationResult(
         message_id=message_id,
