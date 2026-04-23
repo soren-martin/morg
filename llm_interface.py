@@ -36,10 +36,10 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL   = "mistral:7b-instruct-q4_K_M"
 
 VALID_CATEGORIES = frozenset(
-    {"work", "personal", "newsletter", "transactional", "automated", "spam"}
+    {"correspondence", "advertising", "newsletter", "notification", "spam"}
 )
 
-Category = Literal["work", "personal", "newsletter", "transactional", "automated", "spam"]
+Category = Literal["correspondence", "advertising", "newsletter", "notification", "spam"]
 
 # System prompt — instructs the model to return only valid JSON, no preamble.
 _SYSTEM_PROMPT = (
@@ -49,9 +49,24 @@ _SYSTEM_PROMPT = (
 # User prompt template — mirrors the schema shown in §4.3.
 _USER_PROMPT_TEMPLATE = """\
 Classify this email. Return a JSON object with these keys:
-  - "category": one of [work, personal, newsletter, transactional, automated, spam]
+  - "category": one of [correspondence, advertising, newsletter, notification, spam]
   - "action_required": true or false
   - "action_reason": brief string if action_required is true, else null
+
+  Category definitions:
+  - correspondence: Direct personal or professional communication from a real person \
+expecting a reply or acknowledgment; includes meeting requests, questions, project \
+discussions, and job-related emails.
+  - advertising: Promotional content from a brand or service trying to sell or upsell \
+something; includes sales, deals, discount codes, product launches, and re-engagement \
+campaigns.
+  - newsletter: Regularly scheduled digest or editorial content the user subscribed to; \
+includes industry roundups, blogs, and curated link collections — not a direct sales pitch.
+  - notification: Automated system-generated alert about activity in an account or \
+service; includes shipping updates, login alerts, password resets, receipts, and \
+calendar invites.
+  - spam: Unsolicited, deceptive, or malicious email the user did not request and has \
+no legitimate relationship with; includes phishing, scams, and bulk junk.
 
 Subject: {subject}
 From: {sender}
