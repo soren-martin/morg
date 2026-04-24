@@ -48,36 +48,15 @@ _SYSTEM_PROMPT = (
 
 # User prompt template — mirrors the schema shown in §4.3.
 _USER_PROMPT_TEMPLATE = """\
-Classify this email. Return a JSON object with these keys:
-  - "category": one of [correspondence, advertising, newsletter, notification, spam]
-  - "action_required": true or false - follow the strict rules below
-  - "action_reason": brief string if action_required is true, else null
+Classify this email. Return a JSON object with this key only:
+"category": one of [correspondence, advertising, newsletter, notification, spam]
 
-  Category definitions:
-  - correspondence: Direct personal or professional communication from a real person \
-expecting a reply or acknowledgment; includes meeting requests, questions, project \
-discussions, and job-related emails.
-  - advertising: Promotional content from a brand or service trying to sell or upsell \
-something; includes sales, deals, discount codes, product launches, and re-engagement \
-campaigns.
-  - newsletter: Regularly scheduled digest or editorial content the user subscribed to; \
-includes industry roundups, blogs, and curated link collections — not a direct sales pitch.
-  - notification: Automated system-generated alert about activity in an account or \
-service; includes shipping updates, login alerts, password resets, receipts, and \
-calendar invites.
-  - spam: Unsolicited, deceptive, or malicious email the user did not request and has \
-no legitimate relationship with; includes phishing, scams, and bulk junk.
-
-action_required rules (apply strictly — when in doubt, use false):
-  - correspondence: ALWAYS true
-  - advertising:    ALWAYS false
-  - newsletter:     ALWAYS false
-  - spam:           ALWAYS false
-  - notification:   Usually false. Set true ONLY for genuinely urgent alerts such as: \
-a direct message from a recruiter or employer, a security alert requiring a credential \
-change, a payment failure, or a time-sensitive deadline. Routine activity \
-(shipping progress, social media likes/views, marketing re-engagement, low-priority \
-calendar reminders) is false.
+Category definitions:
+- correspondence: Direct personal or professional communication from a real person expecting a reply
+- advertising: Promotional content trying to sell something
+- newsletter: Subscribed editorial/digest content
+- notification: Automated system alerts (receipts, shipping, logins, etc.)
+- spam: Unsolicited or malicious email
 
 Subject: {subject}
 From: {sender}
@@ -169,25 +148,11 @@ def _call_ollama(
 # JSON parsing & validation
 # ---------------------------------------------------------------------------
 
-def _parse_classification(raw: str, message_id: str) -> ClassificationResult:
-    """
-    Parse and validate the model's raw text response into a
-    :class:`ClassificationResult`.
-
-    The model is instructed to return bare JSON, but it occasionally wraps
-    the output in a ```json … ``` fence — strip that if present.
-
-    Raises
-    ------
-    ValueError
-        If the text cannot be parsed as JSON or fails schema validation.
-    """
+def _parse_category(raw: str, message_id: str) -> Category:
     text = raw.strip()
 
-    # Strip optional markdown code fence.
     if text.startswith("```"):
         lines = text.splitlines()
-        # Drop first line (```json or ```) and last line (```).
         text = "\n".join(lines[1:-1]).strip()
 
     try:
@@ -195,59 +160,40 @@ def _parse_classification(raw: str, message_id: str) -> ClassificationResult:
     except json.JSONDecodeError as exc:
         raise ValueError(f"Model returned non-JSON output: {raw!r}") from exc
 
-    # --- Validate required keys -------------------------------------------
-    missing = {"category", "action_required", "action_reason"} - obj.keys()
-    if missing:
-        raise ValueError(f"Missing keys in model response: {missing}")
+    if "category" not in obj:
+        raise ValueError("Missing 'category' in model response")
 
-    category: str = str(obj["category"]).lower()
+    category = str(obj["category"]).lower()
+
     if category not in VALID_CATEGORIES:
         raise ValueError(
             f"Unknown category {category!r}. Expected one of {sorted(VALID_CATEGORIES)}."
         )
 
-    action_required = bool(obj["action_required"])
-    action_reason   = obj["action_reason"] if action_required else None
+    return category  # type: ignore
 
-    # Coerce a non-null action_reason to a plain string.
-    if action_reason is not None:
-        action_reason = str(action_reason).strip() or None
+# ---------------------------------------------------------------------------
+# Determine Action Required
+# ---------------------------------------------------------------------------
+def _determine_action(
+    category: Category,
+    record: EmailRecord,
+) -> tuple[bool, Optional[str]]:
+    if category == "correspondence":
+        return True, "Direct communication requires a response."
 
-    # -------------------------------------------------------------------
-    # Hard override: enforce per-category action_required rules regardless
-    # of what the model returned.  The LLM is only trusted to make the
-    # call for "notification"; all other categories are deterministic.
-    # -------------------------------------------------------------------
-    _ALWAYS_ACTION_REQUIRED = {"correspondence"}
-    _NEVER_ACTION_REQUIRED  = {"advertising", "newsletter", "spam"}
+    if category in {"advertising", "newsletter", "spam"}:
+        return False, None
 
-    if category in _ALWAYS_ACTION_REQUIRED:
-        if not action_required:
-            logger.debug(
-                "Overriding action_required to True for category=%s (msg=%s)",
-                category, message_id,
-            )
-        action_required = True
-        # Ensure there is always a reason string for correspondence.
-        if not action_reason:
-            action_reason = "Direct communication requires a response."
+    # notification → heuristic layer (can expand later)
+    body_lower = record.body.lower()
 
-    elif category in _NEVER_ACTION_REQUIRED:
-        if action_required:
-            logger.debug(
-                "Overriding action_required to False for category=%s (msg=%s)",
-                category, message_id,
-            )
-        action_required = False
-        action_reason   = None
+    if any(keyword in body_lower for keyword in [
+        "urgent", "action required", "verify", "password", "payment failed"
+    ]):
+        return True, "Potentially urgent notification."
 
-    return ClassificationResult(
-        message_id=message_id,
-        category=category,          # type: ignore[arg-type]
-        action_required=action_required,
-        action_reason=action_reason,
-    )
-
+    return False, None
 
 # ---------------------------------------------------------------------------
 # Public classifier
@@ -314,6 +260,7 @@ class EmailClassifier:
     # Single-email inference
     # ------------------------------------------------------------------
 
+
     def classify(self, record: EmailRecord) -> ClassificationResult:
         """
         Run LLM inference on a single :class:`~preprocessing.EmailRecord`.
@@ -347,12 +294,16 @@ class EmailClassifier:
                     num_thread=self.num_thread,
                     timeout=self.timeout,
                 )
-                result = _parse_classification(raw, record.message_id)
-                logger.debug(
-                    "Classified %s → category=%s action_required=%s",
-                    record.message_id,
-                    result.category,
-                    result.action_required,
+
+                category = _parse_category(raw, record.message_id)
+
+                action_required, action_reason = _determine_action(category, record)
+
+                result = ClassificationResult(
+                    message_id=record.message_id,
+                    category=category,
+                    action_required=action_required,
+                    action_reason=action_reason,
                 )
                 return result
 
