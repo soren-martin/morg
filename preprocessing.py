@@ -1,14 +1,13 @@
-# Refactored preprocessing.py (Python 3.13 compatible)
-
 from __future__ import annotations
 
 import base64
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Optional
 
-import html2text
+import html2text  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +31,28 @@ class EmailRecord:
 # ---------------------------------------------------------------------------
 
 _h = html2text.HTML2Text()
-_h.ignore_links = True
-_h.ignore_images = True
+_h.ignore_links = False
+_h.ignore_images = False
+_h.images_to_alt = True
 _h.ignore_emphasis = True
 _h.body_width = 0
 
+
 def strip_html(html: str) -> str:
     return _h.handle(html)
+
+
+def extract_hidden_preview(html: str) -> str:
+    matches = re.findall(
+        r'<(?:span|div)[^>]*display\s*:\s*none[^>]*>(.*?)</(?:span|div)>',
+        html,
+        re.IGNORECASE | re.DOTALL
+    )
+    return " ".join(matches)
+
+
+def clean_links(text: str) -> str:
+    return re.sub(r"\(https?://[^\)]+\)", "", text)
 
 # ---------------------------------------------------------------------------
 # Reply + signature removal
@@ -65,6 +79,7 @@ SIGNATURE_PATTERNS = [
     r"^\s*Sent from my iPhone",
     r"^\s*Sent from my .*",
 ]
+
 
 def remove_quoted_replies(text: str) -> str:
     lines = text.splitlines()
@@ -97,17 +112,39 @@ _INVISIBLE_CHARS_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 _NON_BREAKING_SPACE_RE = re.compile(r"\xa0")
 
+
 def clean_unicode(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+
     text = _INVISIBLE_CHARS_RE.sub("", text)
     text = _CONTROL_CHARS_RE.sub("", text)
     text = _NON_BREAKING_SPACE_RE.sub(" ", text)
+
+    replacements = {
+        "“": '"', "”": '"',
+        "‘": "'", "’": "'",
+        "–": "-", "—": "-",
+        "…": "...",
+    }
+
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+
+    text = re.sub(r"[\U00010000-\U0010ffff]", "", text)
+
     return text
 
 # ---------------------------------------------------------------------------
-# Whitespace + truncation
+# Structure + whitespace
 # ---------------------------------------------------------------------------
 
 _CHAR_BUDGET = 2000
+
+
+def preserve_structure(text: str) -> str:
+    text = re.sub(r"\n\s*\n", "\n\n", text)
+    text = re.sub(r"(?<=\n)([A-Z][A-Z\s]{5,})(?=\n)", r"\n\1\n", text)
+    return text
 
 
 def normalize_whitespace(text: str) -> str:
@@ -126,8 +163,9 @@ def truncate_to_token_budget(text: str, char_budget: int = _CHAR_BUDGET) -> str:
     return truncated + " […]"
 
 # ---------------------------------------------------------------------------
-# MIME traversal (unchanged core logic)
+# MIME traversal (improved)
 # ---------------------------------------------------------------------------
+
 
 def _collect_parts(payload, plain_parts, html_parts, attachments):
     mime_type = payload.get("mimeType", "").lower()
@@ -138,8 +176,13 @@ def _collect_parts(payload, plain_parts, html_parts, attachments):
     header_map = {h["name"].lower(): h["value"] for h in headers}
     disposition = header_map.get("content-disposition", "")
 
+    filename = payload.get("filename")
+
     if "attachment" in disposition:
-        attachments.append("attachment")
+        if filename:
+            attachments.append(filename)
+        else:
+            attachments.append("attachment")
         return
 
     if parts:
@@ -166,14 +209,21 @@ def _extract_from_gmail_payload(payload):
     plain_parts, html_parts, attachments = [], [], []
     _collect_parts(payload, plain_parts, html_parts, attachments)
 
-    if plain_parts:
+    if plain_parts and len(" ".join(plain_parts)) > 200:
         text = "\n\n".join(plain_parts)
         if re.search(r"<[a-zA-Z]", text):
             text = strip_html(text)
         return text, attachments
 
     if html_parts:
-        return strip_html("\n\n".join(html_parts)), attachments
+        html = "\n\n".join(html_parts)
+        preview = extract_hidden_preview(html)
+        text = strip_html(html)
+
+        if preview:
+            text = preview + "\n\n" + text
+
+        return text, attachments
 
     return "", attachments
 
@@ -215,10 +265,12 @@ def preprocess_gmail_message(gmail_message: dict) -> EmailRecord:
 
     raw_body, attachments = _extract_from_gmail_payload(payload)
 
-    # --- NEW CLEAN PIPELINE ---
     body = remove_quoted_replies(raw_body)
     body = remove_signature(body)
+
     body = clean_unicode(body)
+    body = preserve_structure(body)
+    body = clean_links(body)
     body = normalize_whitespace(body)
     body = truncate_to_token_budget(body)
 
