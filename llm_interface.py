@@ -36,10 +36,10 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL   = "mistral:7b-instruct-q4_K_M"
 
 VALID_CATEGORIES = frozenset(
-    {"correspondence", "advertising", "newsletter", "notification", "spam"}
+    {"correspondence",  "newsletter", "notification", "spam"}
 )
 
-Category = Literal["correspondence", "advertising", "newsletter", "notification", "spam"]
+Category = Literal["correspondence", "newsletter", "notification", "spam"]
 
 # System prompt — instructs the model to return only valid JSON, no preamble.
 _SYSTEM_PROMPT = (
@@ -49,14 +49,13 @@ _SYSTEM_PROMPT = (
 # User prompt template — mirrors the schema shown in §4.3.
 _USER_PROMPT_TEMPLATE = """\
 Classify this email. Return a JSON object with this key only:
-"category": one of [correspondence, advertising, newsletter, notification, spam]
+"category": one of [correspondence, newsletter, notification, spam]
 
 Category definitions:
 - correspondence: Direct personal or professional communication from a real person expecting a reply
-- advertising: Promotional content trying to sell something
 - newsletter: Subscribed editorial/digest content
 - notification: Automated system alerts (receipts, shipping, logins, etc.)
-- spam: Unsolicited or malicious email
+- spam: Unsolicited or malicious email (including advertising)
 
 Subject: {subject}
 From: {sender}
